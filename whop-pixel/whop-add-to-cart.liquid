@@ -1,0 +1,163 @@
+{%- comment -%}
+  Whop Pixel — add_to_cart conversion tracking
+  Business ID: biz_RNOKEq1IycxqCA
+
+  Paste this in layout/theme.liquid, immediately BEFORE </body> and AFTER the
+  Whop pixel snippet.
+
+  Fires whop.track("add_to_cart", { value, currency }) exactly once per
+  successful cart add, on every path a Shopify theme can use:
+    1. AJAX adds via fetch()          -> cart drawers, quick-add, Dawn/OS 2.0
+    2. AJAX adds via XMLHttpRequest   -> older jQuery-based themes
+    3. Full page-reload form submits  -> Debut, Brooklyn, other legacy themes
+
+  Deliberately does NOT track page views (the pixel already does) or
+  checkout/purchase (Whop records those server-side from payment data).
+{%- endcomment -%}
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- Config -------------------------------------------------------------
+  // Two adds of the same event inside this window collapse into one. Protects
+  // against a theme that both submits the form and fires its own AJAX call.
+  var DEDUPE_MS = 1000;
+  // How long to keep retrying if the Whop pixel hasn't finished loading yet.
+  var READY_TIMEOUT_MS = 10000;
+
+  var CURRENCY = {{ cart.currency.iso_code | default: shop.currency | json }};
+  {%- if product %}
+  var PAGE_VARIANT_PRICE = {{ product.selected_or_first_available_variant.price | default: 0 | json }};
+  {%- else %}
+  var PAGE_VARIANT_PRICE = null;
+  {%- endif %}
+
+  // ---- Event sender -------------------------------------------------------
+  var lastSent = {};
+
+  function whopTrack(name, props) {
+    var now = Date.now();
+    if (lastSent[name] && now - lastSent[name] < DEDUPE_MS) return;
+    lastSent[name] = now;
+    deliver(name, props, now);
+  }
+
+  // The pixel snippet may still be loading when a quick-add fires, so hold the
+  // event and retry rather than dropping it.
+  function deliver(name, props, startedAt) {
+    if (window.whop && typeof window.whop.track === "function") {
+      try {
+        if (props) { window.whop.track(name, props); }
+        else { window.whop.track(name); }
+      } catch (e) {}
+      return;
+    }
+    if (Date.now() - startedAt > READY_TIMEOUT_MS) return;
+    setTimeout(function () { deliver(name, props, startedAt); }, 200);
+  }
+
+  // ---- Helpers ------------------------------------------------------------
+  // Shopify returns money in minor units (2999 = 29.99).
+  function money(minorUnits) {
+    if (typeof minorUnits !== "number" || !isFinite(minorUnits) || minorUnits <= 0) return null;
+    return Math.round(minorUnits) / 100;
+  }
+
+  // Matches /cart/add, /cart/add.js and locale-prefixed /en-gb/cart/add.js
+  function isCartAdd(url) {
+    if (!url) return false;
+    try {
+      return /\/cart\/add(\.js)?$/.test(new URL(url, window.location.origin).pathname);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // /cart/add.js answers with a bare line item, or { items: [...] } when the
+  // request used the items-array form. Handle both.
+  function valueFromResponse(data) {
+    if (!data) return null;
+    var items = Array.isArray(data.items) ? data.items : [data];
+    var total = 0;
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item) continue;
+      var qty = typeof item.quantity === "number" ? item.quantity : 1;
+      var line;
+      if (typeof item.final_line_price === "number") line = item.final_line_price;
+      else if (typeof item.line_price === "number") line = item.line_price;
+      else if (typeof item.final_price === "number") line = item.final_price * qty;
+      else if (typeof item.price === "number") line = item.price * qty;
+      if (typeof line === "number" && isFinite(line)) total += line;
+    }
+    return money(total);
+  }
+
+  function fireAddToCart(value) {
+    if (value) whopTrack("add_to_cart", { value: value, currency: CURRENCY });
+    else whopTrack("add_to_cart");
+  }
+
+  // ---- 1. fetch() adds (Dawn, Refresh, Craft, most OS 2.0 themes) ---------
+  if (typeof window.fetch === "function") {
+    var originalFetch = window.fetch;
+    window.fetch = function (input) {
+      var url = typeof input === "string" ? input : (input && input.url) || "";
+      var promise = originalFetch.apply(this, arguments);
+      if (isCartAdd(url)) {
+        promise.then(function (response) {
+          if (!response || !response.ok) return;
+          // Clone so the theme still gets to read the body itself.
+          response.clone().json().then(function (data) {
+            fireAddToCart(valueFromResponse(data));
+          }).catch(function () {
+            fireAddToCart(null);
+          });
+        }).catch(function () {});
+      }
+      return promise;
+    };
+  }
+
+  // ---- 2. XMLHttpRequest adds (older jQuery themes) ----------------------
+  if (window.XMLHttpRequest && XMLHttpRequest.prototype) {
+    var originalOpen = XMLHttpRequest.prototype.open;
+    var originalSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__whopIsCartAdd = isCartAdd(url);
+      return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      if (xhr.__whopIsCartAdd) {
+        xhr.addEventListener("load", function () {
+          if (xhr.status < 200 || xhr.status >= 300) return;
+          var data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (e) {}
+          fireAddToCart(valueFromResponse(data));
+        });
+      }
+      return originalSend.apply(this, arguments);
+    };
+  }
+
+  // ---- 3. Full page-reload form submits (legacy themes) ------------------
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!form || !form.action || !isCartAdd(form.action)) return;
+
+    // Defer one tick: if the theme called preventDefault it is doing an AJAX
+    // add, and the hooks above already own this event.
+    setTimeout(function () {
+      if (event.defaultPrevented) return;
+      var field = form.querySelector('[name="quantity"]');
+      var qty = field ? parseInt(field.value, 10) : 1;
+      if (!isFinite(qty) || qty < 1) qty = 1;
+      fireAddToCart(PAGE_VARIANT_PRICE ? money(PAGE_VARIANT_PRICE * qty) : null);
+    }, 0);
+  }, true);
+})();
+</script>

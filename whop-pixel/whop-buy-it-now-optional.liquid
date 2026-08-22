@@ -1,0 +1,56 @@
+{%- comment -%}
+  OPTIONAL add-on — only paste this if your product pages show Shopify's
+  dynamic checkout button ("Buy it now" / Shop Pay / PayPal).
+
+  That button skips /cart/add entirely and jumps straight to checkout, so the
+  main snippet never sees it. This fires the same add_to_cart event for it, so
+  express buyers are not missing from your funnel.
+
+  This is still an add-to-cart signal, not a purchase event — the item enters
+  the cart, and Whop records the actual purchase server-side.
+
+  Paste directly BELOW the main Whop add_to_cart snippet in layout/theme.liquid.
+{%- endcomment -%}
+
+<script>
+(function () {
+  "use strict";
+
+  {%- if product %}
+  var PAGE_VARIANT_PRICE = {{ product.selected_or_first_available_variant.price | default: 0 | json }};
+  {%- else %}
+  var PAGE_VARIANT_PRICE = null;
+  {%- endif %}
+  var CURRENCY = {{ cart.currency.iso_code | default: shop.currency | json }};
+
+  var lastFired = 0;
+
+  document.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.closest) return;
+    if (!target.closest(".shopify-payment-button__button, shopify-accelerated-checkout button")) return;
+
+    // Same 1s guard as the main snippet, so a double-click counts once.
+    var now = Date.now();
+    if (now - lastFired < 1000) return;
+    lastFired = now;
+
+    var form = target.closest("form");
+    var field = form ? form.querySelector('[name="quantity"]') : null;
+    var qty = field ? parseInt(field.value, 10) : 1;
+    if (!isFinite(qty) || qty < 1) qty = 1;
+
+    var props = null;
+    if (PAGE_VARIANT_PRICE) {
+      props = { value: Math.round(PAGE_VARIANT_PRICE * qty) / 100, currency: CURRENCY };
+    }
+
+    if (window.whop && typeof window.whop.track === "function") {
+      try {
+        if (props) { window.whop.track("add_to_cart", props); }
+        else { window.whop.track("add_to_cart"); }
+      } catch (e) {}
+    }
+  }, true);
+})();
+</script>
